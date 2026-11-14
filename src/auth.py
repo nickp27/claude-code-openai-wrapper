@@ -7,6 +7,8 @@ from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 
+from src.quota_tracker import is_quota_error_text
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 
@@ -296,24 +298,18 @@ _CLI_AUTH_FAILURE_MARKERS = (
     "please run /login",
     "invalid api key",
     "authentication_error",
+    "oauth session expired",
+    "failed to authenticate",
     "401",
 )
 
 
-# Markers for a quota rejection, which is not an auth problem and must never
-# be reported as one. Checked before the auth markers.
-_CLI_QUOTA_FAILURE_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "rate_limit",
-    "quota",
-)
-
-
 def _classify_probe_error(blob: str) -> str:
-    lowered = (blob or "").lower()
-    if any(marker in lowered for marker in _CLI_QUOTA_FAILURE_MARKERS):
+    # A quota rejection is not an auth problem and must never be reported as
+    # one, so its markers (shared with the completion error path) win.
+    if is_quota_error_text(blob):
         return "quota_exhausted"
+    lowered = (blob or "").lower()
     if any(marker in lowered for marker in _CLI_AUTH_FAILURE_MARKERS):
         return "auth_failure"
     return "unknown"

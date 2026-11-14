@@ -8,8 +8,14 @@ from pathlib import Path
 import logging
 
 from claude_agent_sdk import query, ClaudeAgentOptions, RateLimitEvent
+from src.constants import CLAUDE_TOOLS
 
-from src.quota_tracker import quota_tracker
+from src.quota_tracker import (
+    is_account_limit_text,
+    is_quota_error_text,
+    parse_reset_clock_time,
+    quota_tracker,
+)
 from src.retry import RetryState, retry_delay
 
 logger = logging.getLogger(__name__)
@@ -79,6 +85,8 @@ class ClaudeResultError(Exception):
         stderr_tail: Optional[str] = None,
         resets_at: Optional[int] = None,
         rate_limit_type: Optional[str] = None,
+        result: Optional[str] = None,
+        error_detail: Optional[str] = None,
     ):
         self.subtype = subtype
         self.num_turns = num_turns
@@ -89,12 +97,53 @@ class ClaudeResultError(Exception):
         # Set only for rate-limit results; drives a real Retry-After.
         self.resets_at = resets_at
         self.rate_limit_type = rate_limit_type
+        self.result = result
+        self.error_detail = error_detail
         detail = error_message or (self.errors[0] if self.errors else subtype)
         super().__init__(f"Claude SDK returned {subtype} after {num_turns} turns: {detail}")
 
 
 # Ceiling on how long an in-request retry will wait for a quota reset.
 _MAX_INLINE_RETRY_AFTER_SECONDS = 60
+
+
+def _error_text_blob(message: Dict[str, Any]) -> str:
+    """Every prose field an error-shaped result can carry, joined."""
+    parts = [
+        message.get("error_message"),
+        message.get("result"),
+        message.get("stderr_tail"),
+        *(message.get("errors") or []),
+    ]
+    return " ".join(str(part) for part in parts if part)
+
+
+def _quota_result_error(blob: str, num_turns: Optional[int] = None) -> ClaudeResultError:
+    """An exhausted-quota failure, shaped so the HTTP layer answers 429.
+
+    resets_at comes from the CLI's own prose when it names a reset hour
+    ('resets 6pm (UTC)'), else from the tracker's last observed rejected
+    window. Claude Code's "session limit" wording names the rolling 5-hour
+    window, so it is recorded as five_hour rather than inventing a separate
+    window type. With no parsed reset, the rejection is still recorded, but
+    only when the prose names an account limit specifically; a bare 429 or
+    generic 'rate limit' text is not reason enough to mark the window
+    rejected on a guess.
+    """
+    resets_at = parse_reset_clock_time(blob) or quota_tracker.blocked_until() or None
+    if resets_at is not None or is_account_limit_text(blob):
+        quota_tracker.record(
+            {"status": "rejected", "rate_limit_type": "five_hour", "resets_at": resets_at},
+            source="error_text",
+        )
+    return ClaudeResultError(
+        subtype="assistant_rate_limit",
+        num_turns=num_turns,
+        errors=["rate_limit"],
+        error_message=blob[:300] or None,
+        resets_at=resets_at,
+        rate_limit_type="five_hour",
+    )
 
 
 class ClaudeCodeCLI:
@@ -235,10 +284,9 @@ class ClaudeCodeCLI:
                 if model:
                     options.model = model
 
-                # Set system prompt - CLAUDE AGENT SDK STRUCTURED FORMAT
-                # Use structured format as per SDK documentation
+                # Plain str: the SDK builds no CLI flag for a {"type": "text"} dict.
                 if system_prompt:
-                    options.system_prompt = {"type": "text", "text": system_prompt}
+                    options.system_prompt = system_prompt
                 else:
                     # Use Claude Code preset to maintain expected behavior
                     options.system_prompt = {"type": "preset", "preset": "claude_code"}
@@ -248,6 +296,11 @@ class ClaudeCodeCLI:
                     options.allowed_tools = allowed_tools
                 if disallowed_tools:
                     options.disallowed_tools = disallowed_tools
+                    # A denylist misses tools added by newer CLI releases, and the
+                    # CLI's user/project settings add ~100K tokens to every request.
+                    if not allowed_tools and set(CLAUDE_TOOLS) <= set(disallowed_tools):
+                        options.tools = []
+                        options.setting_sources = []
 
                 # Set permission mode (needed for tool execution in API context)
                 if permission_mode:
@@ -335,6 +388,17 @@ class ClaudeCodeCLI:
                             getattr(query_error, "api_error_status", None),
                         )
 
+                        # A quota rejection cannot succeed until the window
+                        # resets, often hours out; retrying inline only holds
+                        # the caller's connection open (observed: 10x60s per
+                        # request). Raise now so the HTTP layer answers 429
+                        # with the real reset in Retry-After.
+                        quota_blob = " ".join(
+                            filter(None, [error_str, str(getattr(query_error, "result", "") or "")])
+                        )
+                        if status_code == 429 or is_quota_error_text(quota_blob):
+                            raise _quota_result_error(quota_blob) from query_error
+
                         retry_state.record_attempt(status_code)
 
                         # Check for model fallback on overload
@@ -394,19 +458,37 @@ class ClaudeCodeCLI:
         """
         # Reject errored ResultMessages outright. The SDK puts a synthetic
         # UserMessage('[Request interrupted by user]') just before these, and
-        # we must not let that text escape as response content.
+        # we must not let that text escape as response content. An exhausted
+        # quota arrives as such a result (subtype 'success' with is_error set,
+        # its prose in `result`); classify it across every error-shaped
+        # message so it answers 429, not a generic 502.
+        first_error = None
+        blob_parts = []
+        result_parts = []
         for message in messages:
             subtype = message.get("subtype")
             is_error = message.get("is_error") is True
             if subtype in _ERROR_RESULT_SUBTYPES or is_error:
-                raise ClaudeResultError(
-                    subtype=subtype,
-                    num_turns=message.get("num_turns"),
-                    errors=message.get("errors"),
-                    stop_reason=message.get("stop_reason"),
-                    error_message=message.get("error_message"),
-                    stderr_tail=message.get("stderr_tail"),
-                )
+                if first_error is None:
+                    first_error = message
+                blob_parts.append(_error_text_blob(message))
+                result = message.get("result")
+                if isinstance(result, str) and result:
+                    result_parts.append(result)
+        if first_error is not None:
+            blob = " ".join(part for part in blob_parts if part)
+            if is_quota_error_text(blob):
+                raise _quota_result_error(blob, num_turns=first_error.get("num_turns"))
+            raise ClaudeResultError(
+                subtype=first_error.get("subtype"),
+                num_turns=first_error.get("num_turns"),
+                errors=first_error.get("errors"),
+                stop_reason=first_error.get("stop_reason"),
+                error_message=first_error.get("error_message"),
+                stderr_tail=first_error.get("stderr_tail"),
+                result=" ".join(result_parts) or None,
+                error_detail=blob or None,
+            )
 
         # AssistantMessage.error carries upstream-API failure details (rate
         # limit, billing, auth). Surface those as ClaudeResultError too so the
@@ -415,12 +497,40 @@ class ClaudeCodeCLI:
         for message in messages:
             assistant_error = message.get("error")
             if isinstance(assistant_error, str) and assistant_error in _ASSISTANT_ERROR_VALUES:
+                resets_at = None
+                rate_limit_type = None
+                if assistant_error == "rate_limit":
+                    # No prose field here; the reset hour, if named, is in
+                    # the message's own content blocks ('resets 6pm (UTC)').
+                    # With no parsed reset, only record when the content
+                    # names an account limit specifically; a bare 429 or
+                    # generic 'rate limit' text is not reason enough to mark
+                    # the window rejected on a guess.
+                    content = message.get("content")
+                    blob = (
+                        " ".join(_extract_text_blocks(content)) if isinstance(content, list) else ""
+                    )
+                    resets_at = (
+                        parse_reset_clock_time(blob) or quota_tracker.blocked_until() or None
+                    )
+                    rate_limit_type = "five_hour"
+                    if resets_at is not None or is_account_limit_text(blob):
+                        quota_tracker.record(
+                            {
+                                "status": "rejected",
+                                "rate_limit_type": rate_limit_type,
+                                "resets_at": resets_at,
+                            },
+                            source="error_text",
+                        )
                 raise ClaudeResultError(
                     subtype=f"assistant_{assistant_error}",
                     num_turns=None,
                     errors=[assistant_error],
                     stop_reason=message.get("stop_reason"),
                     error_message=None,
+                    resets_at=resets_at,
+                    rate_limit_type=rate_limit_type,
                 )
 
         # Rate-limit events: status 'rejected' means the upstream cut us off,

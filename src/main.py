@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 import secrets
 import string
 import time
@@ -861,9 +862,9 @@ def _build_sdk_error_response(request_id: str, model: str, err: ClaudeResultErro
             f"claude_sdk_error stderr tail (request_id={request_id}):\n" f"{err.stderr_tail}"
         )
 
-    blob = " ".join(filter(None, [err.error_message, err.stderr_tail]))
-    if _classify_probe_error(blob) == "auth_failure":
-        _auth.cli_health.mark_failed("auth_failure", blob)
+    upgrade_required = _is_cli_upgrade_required(err)
+    if not upgrade_required and _is_cli_auth_failure(err):
+        _auth.cli_health.mark_failed("auth_failure", _safe_sdk_result_message(err))
         logger.warning(
             _kv(
                 "claude_sdk_cli_auth_failed",
@@ -876,11 +877,7 @@ def _build_sdk_error_response(request_id: str, model: str, err: ClaudeResultErro
             status_code=401,
             content={
                 "error": {
-                    "message": (
-                        "Claude CLI is not authenticated. Run `claude /login` "
-                        "on the wrapper host and restart, or set "
-                        "ANTHROPIC_API_KEY."
-                    ),
+                    "message": _safe_sdk_result_message(err),
                     "type": "authentication_error",
                     "code": "claude_cli_not_authenticated",
                 }
@@ -888,16 +885,67 @@ def _build_sdk_error_response(request_id: str, model: str, err: ClaudeResultErro
         )
 
     return JSONResponse(
-        status_code=502,
+        status_code=400 if upgrade_required else 502,
         content={
             "error": {
-                "message": err.error_message
-                or (err.errors[0] if err.errors else f"SDK returned {err.subtype}"),
-                "type": "upstream_sdk_error",
-                "code": err.subtype or "unknown",
+                "message": _safe_sdk_result_message(err),
+                "type": "invalid_request_error" if upgrade_required else "upstream_sdk_error",
+                "code": _sdk_result_error_code(err),
             }
         },
     )
+
+
+def _safe_sdk_result_message(err: ClaudeResultError) -> str:
+    """Return actionable, fixed text for recognized result failures only."""
+    if _is_cli_upgrade_required(err):
+        return (
+            "The wrapper's bundled Claude Code CLI does not support this model. "
+            "Upgrade the wrapper and retry."
+        )
+    if _is_cli_auth_failure(err):
+        return (
+            "Claude CLI is not authenticated. Run `claude /login` on the wrapper host and "
+            "restart, or set ANTHROPIC_API_KEY."
+        )
+    return err.error_message or (
+        err.errors[0] if err.errors else f"SDK returned an error result (subtype={err.subtype})"
+    )
+
+
+def _is_cli_upgrade_required(err: ClaudeResultError) -> bool:
+    return bool(
+        re.search(
+            r"Claude Code \d+\.\d+\.\d+ does not support this model;\s*"
+            r"version \d+\.\d+\.\d+ or newer is required",
+            _sdk_error_blob(err),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _sdk_error_blob(err: ClaudeResultError) -> str:
+    return " ".join(
+        str(value)
+        for value in (
+            err.error_detail,
+            err.result,
+            err.error_message,
+            err.stderr_tail,
+            *(err.errors or []),
+        )
+        if value
+    )
+
+
+def _is_cli_auth_failure(err: ClaudeResultError) -> bool:
+    return _classify_probe_error(_sdk_error_blob(err)) == "auth_failure"
+
+
+def _sdk_result_error_code(err: ClaudeResultError) -> str:
+    if _is_cli_upgrade_required(err):
+        return "claude_cli_upgrade_required"
+    return err.subtype or "unknown"
 
 
 # Map AssistantMessage error literals to HTTP status codes so each upstream
@@ -992,12 +1040,14 @@ def _handle_claude_result_error(
 
     Records the outcome against the circuit breaker so a burst of SDK
     failures across many requests trips the breaker and fails-fast future
-    traffic for a short cool-off period.
+    traffic for a short cool-off period. An exhausted account quota is not
+    a service failure, so it is recorded as neither success nor failure.
     """
     # error_max_turns still returned a 200 to the caller with finish_reason=
     # length; treat it as upstream "bad" for breaker purposes because from a
     # reliability perspective it's a failed completion.
-    sdk_circuit_breaker.record(success=False)
+    if err.subtype != "assistant_rate_limit":
+        sdk_circuit_breaker.record(success=False)
     if err.subtype == "error_max_turns":
         return _build_error_max_turns_response(request_id, model, err)
     if err.subtype in _ASSISTANT_ERROR_STATUS:
@@ -1063,8 +1113,10 @@ async def generate_streaming_response(
 
         # Function calling: inject tool definitions into system prompt
         has_tools = request.tools and len(request.tools) > 0
+        tool_calls_emitted = False
         if has_tools:
             tools_dicts = [t.model_dump() for t in request.tools]
+            tool_names = {t.get("function", {}).get("name") for t in tools_dicts}
             tools_prompt = build_tools_system_prompt(tools_dicts, request.tool_choice)
             if tools_prompt:
                 if system_prompt:
@@ -1272,7 +1324,7 @@ async def generate_streaming_response(
         # Handle tool call buffer: parse and emit tool_calls
         if has_tools and tool_call_buffer:
             combined = "".join(tool_call_buffer)
-            parsed_calls, remaining_text = parse_tool_calls(combined)
+            parsed_calls, remaining_text = parse_tool_calls(combined, tool_names)
             if not role_sent:
                 initial_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1287,7 +1339,12 @@ async def generate_streaming_response(
                 role_sent = True
             if parsed_calls:
                 formatted = format_tool_calls(parsed_calls)
-                tc_delta = {"tool_calls": [tc.model_dump() for tc in formatted]}
+                # OpenAI clients accumulate streamed tool calls by index.
+                tc_delta = {
+                    "tool_calls": [
+                        {"index": i, **tc.model_dump()} for i, tc in enumerate(formatted)
+                    ]
+                }
                 if remaining_text.strip():
                     tc_delta["content"] = remaining_text.strip()
                 tc_chunk = ChatCompletionStreamResponse(
@@ -1297,6 +1354,7 @@ async def generate_streaming_response(
                 )
                 yield f"data: {tc_chunk.model_dump_json()}\n\n"
                 content_sent = True
+                tool_calls_emitted = True
             elif combined.strip():
                 text_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1429,15 +1487,20 @@ async def generate_streaming_response(
                         errors=sdk_error.errors,
                     )
                 )
+                upgrade_required = _is_cli_upgrade_required(sdk_error)
+                auth_failure = not upgrade_required and _is_cli_auth_failure(sdk_error)
                 err_body = {
-                    "message": sdk_error.error_message
-                    or (
-                        sdk_error.errors[0]
-                        if sdk_error.errors
-                        else f"SDK returned {sdk_error.subtype}"
+                    "message": _safe_sdk_result_message(sdk_error),
+                    "type": (
+                        "invalid_request_error"
+                        if upgrade_required
+                        else "authentication_error" if auth_failure else "upstream_sdk_error"
                     ),
-                    "type": "upstream_sdk_error",
-                    "code": sdk_error.subtype or "unknown",
+                    "code": (
+                        "claude_cli_not_authenticated"
+                        if auth_failure
+                        else _sdk_result_error_code(sdk_error)
+                    ),
                 }
                 # The status line is already flushed, so the reset time can
                 # only travel in the body. Without it a streaming caller has
@@ -1476,7 +1539,13 @@ async def generate_streaming_response(
         final_chunk = ChatCompletionStreamResponse(
             id=request_id,
             model=request.model,
-            choices=[StreamChoice(index=0, delta={}, finish_reason="stop")],
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta={},
+                    finish_reason="tool_calls" if tool_calls_emitted else "stop",
+                )
+            ],
             usage=usage_data,
         )
         yield f"data: {final_chunk.model_dump_json()}\n\n"
@@ -1706,6 +1775,7 @@ async def chat_completions(
             has_tools = request_body.tools and len(request_body.tools) > 0
             if has_tools:
                 tools_dicts = [t.model_dump() for t in request_body.tools]
+                tool_names = {t.get("function", {}).get("name") for t in tools_dicts}
                 tools_prompt = build_tools_system_prompt(tools_dicts, request_body.tool_choice)
                 if tools_prompt:
                     if system_prompt:
@@ -1804,7 +1874,7 @@ async def chat_completions(
             tool_calls_list = None
             finish_reason = "stop"
             if has_tools:
-                parsed_calls, remaining_text = parse_tool_calls(assistant_content)
+                parsed_calls, remaining_text = parse_tool_calls(assistant_content, tool_names)
                 if parsed_calls:
                     tool_calls_list = format_tool_calls(parsed_calls)
                     assistant_content = remaining_text.strip() if remaining_text.strip() else None
@@ -1876,7 +1946,7 @@ async def chat_completions(
                     num_turns=metadata.get("num_turns"),
                     duration_ms=metadata.get("duration_ms"),
                     total_cost_usd=metadata.get("total_cost_usd"),
-                    is_error=False,
+                    failed=False,
                     finish_reason=finish_reason,
                     model=request_body.model,
                     prompt_tokens=prompt_tokens,
@@ -1992,6 +2062,30 @@ async def anthropic_messages(
                             "type": "rate_limit_error",
                             "message": _safe_assistant_error_message(err.subtype),
                             **detail,
+                        },
+                    },
+                )
+            if _is_cli_upgrade_required(err):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": _sdk_result_error_code(err),
+                            "message": _safe_sdk_result_message(err),
+                        },
+                    },
+                )
+            if _is_cli_auth_failure(err):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "code": "claude_cli_not_authenticated",
+                            "message": _safe_sdk_result_message(err),
                         },
                     },
                 )

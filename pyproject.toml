@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "claude-code-openai-wrapper"
-version = "2.10.1"
+version = "2.14.0"
 description = "OpenAI API-compatible wrapper for Claude Code"
 authors = ["Richard Atkinson <richardatk01@gmail.com>"]
 readme = "README.md"
@@ -26,9 +26,9 @@ sse-starlette = "^2.1.3"
 # Content-Length buffers the whole body in memory). 0.0.31 covers all four.
 python-multipart = ">=0.0.31"
 # Pin the SDK exactly; bump deliberately and regenerate poetry.lock in the
-# same commit. 2.10.0: 0.2.128 -> 0.2.148. Re-check RateLimitInfo field names
+# same commit. Re-check RateLimitInfo field names
 # on each bump; the wrapper reads them off the message stream.
-claude-agent-sdk = {version = "0.2.148", extras = ["otel"]}
+claude-agent-sdk = {version = "0.2.180", extras = ["otel"]}
 slowapi = "^0.1.9"
 
 # Security floors for transitive dependencies. Each one pinned here is a
@@ -44,27 +44,40 @@ slowapi = "^0.1.9"
 #    GHSA-mf9v-mfxr-j63j decompression-bomb safeguard bypass)
 # - cryptography: >=50.0.0 closes GHSA-g6cj-pr64-35w5 (Dependabot #29) and
 #   supersedes the >=48.0.1 floor for GHSA-537c-gmf6-5ccf (#23).
-# - PyJWT: floor raised to >=2.13.0 to close five alerts (#14-18), incl.
+# - PyJWT: >=2.14.0 fixes the September 2026 JWT validation advisories.
+#   The previous >=2.13.0 floor closed five alerts (#14-18), incl.
 #   GHSA-xgmm-8j9v-c9wx (public-key JWK accepted as HMAC secret -> forged
 #   HS256 tokens, high) and the PyJWKClient SSRF / DoS issues.
 # - joserfc: new floor >=1.6.7 closes GHSA-wphv-vfrh-23q5 (b64=false RFC7797
 #   JWS payloads bypass payload-size limits, medium). Transitive via authlib.
-#   Dependabot #25.
-# - Authlib: via claude-agent-sdk
-# - mcp: >=1.28.1 closes Dependabot #26-28 (GHSA-hvrp-rf83-w775,
+#   Dependabot #25. >=1.7.6 closes CVE-2026-119283 and CVE-2026-119284
+#   (pip-audit; no Dependabot alert yet).
+# - Authlib: via claude-agent-sdk. >=1.9.1 closes Dependabot #59-66, incl.
+#   GHSA-6v38-4h7w-rj9h (empty JWS signatures accepted, critical) and
+#   GHSA-8m4g-j4wp-wgcg (empty HMAC key allows JWT forgery, high).
+# - opentelemetry-api: >=1.45.1 closes GHSA-xcq7-p3pf-p88h (unbounded
+#   tracestate parsing, medium). Via the SDK's [otel] extra. Dependabot #58.
+# - mcp: >=1.30.0 closes Dependabot #55 (GHSA-84m7-p3x7-pcfv, unbounded
+#   StreamableHTTP sessions) on top of #26-28 (GHSA-hvrp-rf83-w775,
 #   GHSA-jpw9-pfvf-9f58, GHSA-vj7q-gjh5-988w)
-# - nltk: >=3.10.0 closes Dependabot #24 (GHSA-p4gq-832x-fm9v)
+# - nltk: gone from the graph since 2.12.0, when the unused dev-only `safety`
+#   (its only parent) was dropped. CI scans deps with pip-audit.
+# - anyio: >=4.14.2 closes GHSA-82r6-8w77-94w6 (TLSStream IDNA 2003 host
+#   encoding -> TLS cert spoofing, critical) and GHSA-5p39-cfhj-2xmp
+#   (process-pool workers block on undrained stderr, medium). Transitive
+#   via claude-agent-sdk / starlette / anthropic.
 starlette = ">=1.0.1"
 urllib3 = ">=2.7.0"
 cryptography = ">=50.0.0"
-pyjwt = ">=2.13.0"
-joserfc = ">=1.6.7"
-authlib = ">=1.6.9"
-mcp = ">=1.28.1"
-nltk = ">=3.10.0"
+pyjwt = ">=2.14.0"
+joserfc = ">=1.7.6"
+authlib = ">=1.9.1"
+mcp = ">=1.30.0,<2.0.0"
+anyio = ">=4.14.2"
+opentelemetry-api = ">=1.45.1"
 
 [tool.poetry.group.dev.dependencies]
-black = "^26.3.1"
+black = "^26.10.1"
 pytest = "^9.0.3"
 pytest-asyncio = "^1.3.0"
 requests = "^2.33.0"
@@ -72,7 +85,6 @@ openai = "^1.0.0"
 pytest-cov = "^7.0.0"
 mypy = "^1.14.0"
 bandit = "^1.8.0"
-safety = "^3.2.0"
 hypothesis = "^6.122.0"
 
 [build-system]

@@ -12,6 +12,7 @@ import tempfile
 import sys
 from unittest.mock import MagicMock, patch, AsyncMock
 from pathlib import Path
+from src.claude_cli import ClaudeResultError
 
 
 class TestClaudeCodeCLIParseMessage:
@@ -218,12 +219,12 @@ class TestClaudeCodeCLIParseMessage:
                 "num_turns": 1,
                 "duration_ms": 100,
                 "result": None,
-                "errors": ["rate_limited_by_upstream"],
+                "errors": ["upstream_exploded"],
             },
         ]
         with pytest.raises(ClaudeResultError) as excinfo:
             cli.parse_claude_message(messages)
-        assert "rate_limited_by_upstream" in excinfo.value.errors
+        assert "upstream_exploded" in excinfo.value.errors
 
     def test_stderr_tail_propagates_through_result_error(self, cli_class):
         """The run_completion loop copies the CLI subprocess's captured
@@ -661,7 +662,40 @@ class TestClaudeCodeCLIRunCompletion:
 
             assert len(captured_options) == 1
             opts = captured_options[0]
-            assert opts.system_prompt == {"type": "text", "text": "You are helpful"}
+            assert opts.system_prompt == "You are helpful"
+
+            from claude_agent_sdk._internal.transport.subprocess_cli import (
+                SubprocessCLITransport,
+            )
+
+            transport = SubprocessCLITransport(prompt="Hello", options=opts)
+            transport._cli_path = "claude"
+            cmd = transport._build_command()
+            assert cmd[cmd.index("--system-prompt") + 1] == "You are helpful"
+
+    @pytest.mark.asyncio
+    async def test_run_completion_tools_disabled_gives_no_builtin_tools(self, cli_instance):
+        """Disallowing every known tool also empties the CLI's base tool set."""
+        from src.constants import CLAUDE_TOOLS, DEFAULT_DISALLOWED_TOOLS
+
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield {"type": "assistant", "content": "Response"}
+
+        with patch("src.claude_cli.query", mock_query):
+            async for _ in cli_instance.run_completion("Hello", disallowed_tools=CLAUDE_TOOLS):
+                pass
+            async for _ in cli_instance.run_completion(
+                "Hello", disallowed_tools=DEFAULT_DISALLOWED_TOOLS
+            ):
+                pass
+
+        assert captured_options[0].tools == []
+        assert captured_options[0].setting_sources == []
+        assert captured_options[1].tools is None
+        assert captured_options[1].setting_sources is None
 
     @pytest.mark.asyncio
     async def test_run_completion_with_model(self, cli_instance):
@@ -836,3 +870,206 @@ class TestClaudeCodeCLICleanupException:
 
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
+
+class TestQuotaErrorClassification:
+    """An exhausted quota must surface as a rate-limit error, not a 502.
+
+    Observed 2026-08-31: the CLI exits 1 with 'You've hit your session limit,
+    resets 6pm (UTC)' after emitting ResultMessage(subtype='success',
+    is_error=True), which the old first-error raise reported as
+    'SDK returned success'.
+    """
+
+    @pytest.fixture
+    def cli(self):
+        from src.claude_cli import ClaudeCodeCLI
+
+        mock = MagicMock()
+        mock.parse_claude_message = ClaudeCodeCLI.parse_claude_message.__get__(mock, ClaudeCodeCLI)
+        return mock
+
+    def test_session_limit_result_is_rate_limit(self, cli):
+        from src.claude_cli import ClaudeResultError
+
+        messages = [
+            {
+                "subtype": "success",
+                "is_error": True,
+                "num_turns": 1,
+                "errors": [],
+                "result": "You've hit your session limit · resets 6pm (UTC)",
+            }
+        ]
+        with pytest.raises(ClaudeResultError) as exc_info:
+            cli.parse_claude_message(messages)
+        err = exc_info.value
+        assert err.subtype == "assistant_rate_limit"
+        assert err.errors == ["rate_limit"]
+        assert err.resets_at is not None
+
+    def test_quota_text_in_a_later_flattened_exception_still_classifies(self, cli):
+        """run_completion's outer handler flattens exceptions into an
+        error_during_execution dict; the limit prose there must classify."""
+        from src.claude_cli import ClaudeResultError
+
+        messages = [
+            {
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error_message": (
+                    "Claude SDK returned assistant_rate_limit after None turns: "
+                    "You've hit your session limit · resets 6pm (UTC)"
+                ),
+            }
+        ]
+        with pytest.raises(ClaudeResultError) as exc_info:
+            cli.parse_claude_message(messages)
+        assert exc_info.value.subtype == "assistant_rate_limit"
+
+    def test_non_quota_error_result_raises_unchanged(self, cli):
+        from src.claude_cli import ClaudeResultError
+
+        messages = [
+            {
+                "subtype": "success",
+                "is_error": True,
+                "num_turns": 1,
+                "result": "something else broke",
+            }
+        ]
+        with pytest.raises(ClaudeResultError) as exc_info:
+            cli.parse_claude_message(messages)
+        assert exc_info.value.subtype == "success"
+
+    def test_error_result_prose_is_retained_for_internal_classification(self, cli):
+        prose = "Failed to authenticate: OAuth session expired and could not be refreshed"
+        with pytest.raises(ClaudeResultError) as exc_info:
+            cli.parse_claude_message([{"subtype": "success", "is_error": True, "result": prose}])
+        assert exc_info.value.result == prose
+        assert exc_info.value.error_message is None
+
+    def test_successful_result_prose_is_not_treated_as_error(self, cli):
+        prose = "The wrapper says Claude Code does not support this model."
+        assert (
+            cli.parse_claude_message([{"subtype": "success", "is_error": False, "result": prose}])
+            == prose
+        )
+
+    def test_quota_error_records_the_parsed_reset(self):
+        from src.claude_cli import _quota_result_error
+        from src.quota_tracker import QuotaTracker
+
+        fresh = QuotaTracker()
+        with patch("src.claude_cli.quota_tracker", fresh):
+            err = _quota_result_error("hit your session limit; resets 6pm (UTC)")
+        assert err.resets_at is not None
+        assert fresh.blocked_until() == err.resets_at
+
+    def test_quota_error_records_under_five_hour_window(self):
+        """Claude Code's 'session limit' prose names the rolling 5-hour
+        window; it must not invent a separate session_limit window type."""
+        from src.claude_cli import _quota_result_error
+        from src.quota_tracker import QuotaTracker
+
+        fresh = QuotaTracker()
+        with patch("src.claude_cli.quota_tracker", fresh):
+            err = _quota_result_error("hit your session limit; resets 6pm (UTC)")
+        assert err.rate_limit_type == "five_hour"
+        window = fresh.snapshot()["windows"]["five_hour"]
+        assert window["status"] == "rejected"
+
+    def test_quota_error_with_no_reset_still_records_rejection(self):
+        from src.claude_cli import _quota_result_error
+        from src.quota_tracker import QuotaTracker
+
+        fresh = QuotaTracker()
+        with patch("src.claude_cli.quota_tracker", fresh):
+            err = _quota_result_error("hit your session limit, no reset named")
+        assert err.resets_at is None
+        window = fresh.snapshot()["windows"]["five_hour"]
+        assert window["status"] == "rejected"
+        assert window["resets_at"] is None
+
+    def test_weekly_limit_wording_with_no_reset_still_records(self):
+        from src.claude_cli import _quota_result_error
+        from src.quota_tracker import QuotaTracker
+
+        fresh = QuotaTracker()
+        with patch("src.claude_cli.quota_tracker", fresh):
+            err = _quota_result_error("you've hit your weekly limit, no reset named")
+        assert err.resets_at is None
+        window = fresh.snapshot()["windows"]["five_hour"]
+        assert window["status"] == "rejected"
+
+    def test_generic_rate_limit_text_with_no_reset_is_not_recorded(self):
+        """A bare 'rate limit' mention or 429 with no parsed reset and no
+        account-limit wording must not mark five_hour rejected on a guess."""
+        from src.claude_cli import _quota_result_error
+        from src.quota_tracker import QuotaTracker
+
+        fresh = QuotaTracker()
+        with patch("src.claude_cli.quota_tracker", fresh):
+            err = _quota_result_error("upstream rate limit, no reset named")
+        assert err.resets_at is None
+        assert fresh.snapshot()["observed_windows"] == 0
+
+
+class TestRunCompletionQuotaFailFast:
+    """A quota rejection must not be retried inline (observed: 10x60s per
+    request, holding the caller's connection until the window reset)."""
+
+    @pytest.fixture
+    def cli_instance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("src.auth.validate_claude_code_auth") as mock_validate:
+                with patch("src.auth.auth_manager") as mock_auth:
+                    mock_validate.return_value = (True, {"method": "anthropic"})
+                    mock_auth.get_claude_code_env_vars.return_value = {
+                        "ANTHROPIC_API_KEY": "test-key"
+                    }
+
+                    from src.claude_cli import ClaudeCodeCLI
+
+                    yield ClaudeCodeCLI(cwd=temp_dir)
+
+    @pytest.mark.asyncio
+    async def test_session_limit_exception_is_not_retried(self, cli_instance):
+        attempts = []
+
+        async def mock_query(*args, **kwargs):
+            attempts.append(1)
+            raise RuntimeError(
+                "Claude Code returned an error result: "
+                "You've hit your session limit · resets 6pm (UTC) (exit code: 1)"
+            )
+            yield  # pragma: no cover - makes this an async generator
+
+        collected = []
+        with patch("src.claude_cli.query", mock_query):
+            async for msg in cli_instance.run_completion("Hello"):
+                collected.append(msg)
+
+        # One attempt, no inline retries; the failure is flattened into an
+        # error result dict whose prose parse_claude_message maps to 429.
+        assert len(attempts) == 1
+        assert collected[-1]["is_error"] is True
+        assert "session limit" in collected[-1]["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_api_error_status_429_is_not_retried(self, cli_instance):
+        attempts = []
+
+        class FakeResultError(Exception):
+            api_error_status = 429
+
+        async def mock_query(*args, **kwargs):
+            attempts.append(1)
+            raise FakeResultError("upstream said no")
+            yield  # pragma: no cover
+
+        with patch("src.claude_cli.query", mock_query):
+            async for _ in cli_instance.run_completion("Hello"):
+                pass
+
+        assert len(attempts) == 1

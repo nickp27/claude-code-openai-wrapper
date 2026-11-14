@@ -38,12 +38,27 @@ COPY . /app
 # "which SDK shipped in the image?" from guesswork into a one-shot `cat`.
 # Must run via `poetry run` because dependencies are installed into the
 # Poetry-managed virtualenv, not the system site-packages.
-RUN poetry run python -c "\
-import importlib.metadata, pathlib, claude_agent_sdk;\
-sdk = importlib.metadata.version('claude-agent-sdk');\
-cli = pathlib.Path(claude_agent_sdk.__file__).parent / '_bundled' / 'claude';\
-open('/app/BUILD_INFO', 'w').write(f'claude-agent-sdk={sdk}\\nbundled_cli_present={cli.exists()}\\nbundled_cli_path={cli}\\n')\
-" || echo "BUILD_INFO stamp skipped (non-fatal)"
+RUN poetry run python - <<'PYCODE'
+import importlib.metadata
+import pathlib
+import re
+import subprocess
+
+import claude_agent_sdk
+
+sdk = importlib.metadata.version("claude-agent-sdk")
+cli = pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+version = subprocess.run(
+    [str(cli), "--version"], check=True, capture_output=True, text=True, timeout=30
+).stdout.strip()
+match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+if match is None or tuple(map(int, match.groups())) < (2, 1, 280):
+    raise RuntimeError("Bundled Claude CLI 2.1.280 or newer is required")
+pathlib.Path("/app/BUILD_INFO").write_text(
+    f"claude-agent-sdk={sdk}\nbundled_cli_version={version}\n"
+    f"bundled_cli_present=True\nbundled_cli_path={cli}\n"
+)
+PYCODE
 
 # pip vendors its own msgpack and setuptools, which trip the trivy
 # HIGH/CRITICAL gate on every build even though nothing imports them. The
@@ -75,10 +90,14 @@ CMD ["poetry", "run", "uvicorn", "src.main:app", \
      "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
 # -----------------------------------------------------------------------------
-# Prod stage: multi-worker, no reload. Default target for deployment images.
-# Override worker count via the UVICORN_WORKERS env var at runtime if needed.
+# Prod stage: no reload. Default target for deployment images.
+# Single worker by default: the quota tracker and circuit breaker are
+# in-process state, so >1 worker splits that state and /v1/usage answers from
+# whichever worker served the request. Request handling is async around the
+# SDK subprocess, so one worker still serves concurrent requests; override via
+# the UVICORN_WORKERS env var at runtime if a deployment needs more.
 # -----------------------------------------------------------------------------
 FROM base AS prod
-ENV UVICORN_WORKERS=2
+ENV UVICORN_WORKERS=1
 CMD ["sh", "-c", "poetry run uvicorn src.main:app \
     --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS} --no-access-log"]
